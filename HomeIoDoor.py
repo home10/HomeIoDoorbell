@@ -9,8 +9,11 @@ import numpy
 import requests
 import os
 from threading import Thread
+from RPi import GPIO
 
 door_name = 'DoorBell_1'
+seen_persons = 0
+reported = False
 
 imageupload_url = 'https://rickrongen.nl/ims/'
 imagedownload_url = 'https://rickrongen.nl/ims/?id=%s'
@@ -30,20 +33,24 @@ callback_name = callback_result.method.queue
 
 rabbitmq_callback_channel.queue_bind(exchange='callback', queue=callback_name, routing_key=door_name)
 callback_thread = None
+force_send_picture = False
 
-door_open_time = time.time()
+door_open_time = 0
+
+door_led_pwm = None
 
 
-def callback(ch, method, properties, body):
+def rabbitmq_callback(ch, method, properties, body):
     global door_open_time
     print body
+    print 'At: %d' % time.time()
     inputmsg = json.loads(body)
     if inputmsg['origin'] != door_name:
         print "Not my door!"
         return
 
     # TODO open door
-    print "Door %s by %s" % ("opened" if inputmsg['allowed'] else 'closed', inputmsg['user'])
+    print "Door %s by %s on %d" % ("opened" if inputmsg['allowed'] else 'closed', inputmsg['user'], time.time())
     door_open_time = inputmsg['timestamp']
 
     msg = {'timestamp': time.time(),
@@ -55,9 +62,23 @@ def callback(ch, method, properties, body):
     rabbitmq_channel.basic_publish(exchange='chat', routing_key='', body=json.dumps(msg))
 
 
-rabbitmq_callback_channel.basic_consume(callback,
+rabbitmq_callback_channel.basic_consume(rabbitmq_callback,
                                         queue=callback_name,
                                         no_ack=True)
+
+def gpio_button_click(channel):
+    global force_send_picture
+    time.sleep(0.1)
+    if not GPIO.input(channel):
+        print("Force Sending")
+        force_send_picture = True
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(17, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.add_event_detect(17, GPIO.FALLING, callback=gpio_button_click, bouncetime=300)
+
+GPIO.setup(27, GPIO.OUT)
+door_led_pwm = GPIO.PWM(27, 50)
 
 
 def uploadImage(data_file):
@@ -68,6 +89,7 @@ def uploadImage(data_file):
 
 def reportRing(img):
     # type: (numpy.ndarray) -> None
+    print 'Reporting user at %d' % time.time()
     if img is not None:
         tmp_file = '/tmp/%d-img.jpg' % time.time()
         cv2.imwrite(tmp_file, img)
@@ -88,26 +110,11 @@ def start_thread():
     callback_thread = Thread(target=rabbitmq_callback_channel.start_consuming)
     callback_thread.start()
 
-
-def main():
-    start_thread()
-    vc = cv2.VideoCapture(0)
-
-    face_cascade = cv2.CascadeClassifier('haarcascade_frontalface_default.xml')
-    seen_persons = 0
-    reported = False
-
-    while True:
-        ret, frame = vc.read()
-
-        if not ret:
-            print "FATAL got no frame!"
-            break
-
-        framew, frameh, framed = frame.shape
-
+def handle_image(frame):
+    global reported, seen_persons, face_cascade, thread_running, force_send_picture
+    try:
         grayscale = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
+    
         faces = face_cascade.detectMultiScale(
             grayscale,
             scaleFactor=1.1,
@@ -115,32 +122,80 @@ def main():
             minSize=(30, 30),
             flags=cv2.CASCADE_SCALE_IMAGE
         )
-
-        for (x, y, w, h) in faces:
-            cv2.rectangle(frame, (x, y), (x + w, y + h), ((0, 255, 0) if reported else (0, 0, 255)), 2)
-
-        if door_open_time + 10 >= time.time():
-            cv2.rectangle(frame, (0, 0), (frameh - 1, framew - 1), (0, 255, 0), 2)
-
-        if len(faces) > 0:
-            seen_persons = min(seen_persons + 1, 10)
-            if not reported and seen_persons == 10:
-                reportRing(frame)
-                reported = True
+    
+    #    for (x, y, w, h) in faces:
+    #        cv2.rectangle(frame, (x, y), (x + w, y + h), ((0, 255, 0) if reported else (0, 0, 255)), 2)
+    
+    
+        if force_send_picture:
+            force_send_picture = False
+            reportRing(frame)
+            reported = True
         else:
-            seen_persons = max(seen_persons - 1, 0)
-            if seen_persons == 0:
-                reported = False
+            if len(faces) > 0:
+                seen_persons = min(seen_persons + 1, 3)
+                if not reported and seen_persons == 3:
+                    reportRing(frame)
+                    reported = True
+            else:
+                seen_persons = max(seen_persons - 1, 0)
+                if seen_persons == 0:
+                    reported = False
+    except:
+        pass
+    thread_running = False
+
+
+def main():
+    global face_cascade, thread_running, door_led_pwm, door_open_time
+    thread_running = False
+    start_thread()
+    
+    door_led_pwm.start(0)
+
+    vc = cv2.VideoCapture(0)
+
+    face_cascade = cv2.CascadeClassifier('haarcascade_frontalface_default.xml')
+
+    while True:
+        ret, frame = vc.read()
+
+        if not ret:
+            print "FATAL got no frame!"
+            break
+        
+        if not thread_running:
+            print('Starting thread')
+            thread_running = True
+            process_thread = Thread(target=handle_image, args=(frame,))
+            process_thread.start()
+
+        framew, frameh, framed = frame.shape
+
+        door_open_delta = time.time() - door_open_time
+        if door_open_delta < 10:
+            door_led_pwm.ChangeDutyCycle(min(100, max(0, door_open_delta * 10)))
+            cv2.rectangle(frame, (0, 0), (frameh - 1, framew - 1), (0, 255, 0), 2)
+        else:
+            door_led_pwm.ChangeDutyCycle(0)
 
         cv2.imshow("HomeIoDoor", frame)
 
-        pressed_key = cv2.waitKey(240) & 0xFF
+        pressed_key = cv2.waitKey(32) & 0xFF
 
         if pressed_key == ord('q'):
             break
         elif pressed_key == ord('s'):
             reportRing(frame)
+        elif pressed_key == ord('t'):
+            print("OPEN THE DAM DOOR")
+            door_open_time = time.time()
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except:
+        door_led_pwm.stop()
+        GPIO.cleanup()
+        raise
