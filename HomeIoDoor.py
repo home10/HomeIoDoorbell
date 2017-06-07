@@ -1,5 +1,5 @@
 #!/usr/bin/env python2.7
-from StringIO import StringIO
+import traceback
 
 import cv2
 import pika
@@ -10,6 +10,7 @@ import requests
 import os
 from threading import Thread
 from RPi import GPIO
+from uuid import uuid1
 
 door_name = 'DoorBell_1'
 seen_persons = 0
@@ -37,34 +38,54 @@ force_send_picture = False
 
 door_open_time = 0
 
-door_led_pwm = None
+doorbell_rings = {}
 
 
 def rabbitmq_callback(ch, method, properties, body):
     global door_open_time
     print body
     print 'At: %d' % time.time()
-    inputmsg = json.loads(body)
-    if inputmsg['origin'] != door_name:
-        print "Not my door!"
+    try:
+        inputmsg = json.loads(body)
+    except ValueError:
+        traceback.print_exc()
         return
+    try:
+        if inputmsg['origin'] != door_name:
+            print "Not my door!"
+            return
 
-    # TODO open door
-    print "Door %s by %s on %d" % ("opened" if inputmsg['allowed'] else 'closed', inputmsg['user'], time.time())
-    door_open_time = inputmsg['timestamp']
+        if inputmsg['id'] not in doorbell_rings:
+            if 'canceled' in doorbell_rings[inputmsg['id']] and \
+                    doorbell_rings[inputmsg['id']]['canceled']:
+                print 'Ring was already canceled'
+                return
 
-    msg = {'timestamp': time.time(),
-           'type': 'doorbell-cancel',
-           'origin': door_name,
-           'allowed': inputmsg['allowed'],
-           'user': inputmsg['user']}
+        # TODO open door
+        print "Door %s by %s on %d" % \
+              ("opened" if inputmsg['allowed'] else 'closed', inputmsg['user'], time.time())
+        door_open_time = time.time()  # inputmsg['timestamp']
 
-    rabbitmq_channel.basic_publish(exchange='chat', routing_key='', body=json.dumps(msg))
+        msg = {'id': inputmsg['id'],
+               'timestamp': time.time(),
+               'type': 'doorbell-cancel',
+               'origin': door_name,
+               'allowed': inputmsg['allowed'],
+               'user': inputmsg['user']}
+
+        rabbitmq_channel.basic_publish(exchange='chat', routing_key='', body=json.dumps(msg))
+
+        doorbell_rings[inputmsg['id']]['canceled'] = True
+        doorbell_rings[inputmsg['id']]['response'] = inputmsg
+        doorbell_rings[inputmsg['id']]['cancel_msg'] = msg
+    except KeyError:
+        traceback.print_exc()
 
 
 rabbitmq_callback_channel.basic_consume(rabbitmq_callback,
                                         queue=callback_name,
                                         no_ack=True)
+
 
 def gpio_button_click(channel):
     global force_send_picture
@@ -72,6 +93,7 @@ def gpio_button_click(channel):
     if not GPIO.input(channel):
         print("Force Sending")
         force_send_picture = True
+
 
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(17, GPIO.IN, pull_up_down=GPIO.PUD_UP)
@@ -83,7 +105,8 @@ door_led_pwm = GPIO.PWM(27, 50)
 
 def uploadImage(data_file):
     # type: (str) -> str
-    resp = requests.post(url=imageupload_url, files={'userfile': (data_file, open(data_file, 'rb'), 'image/jpeg')})
+    resp = requests.post(url=imageupload_url,
+                         files={'userfile': (data_file, open(data_file, 'rb'), 'image/jpeg')})
     return imagedownload_url % resp.content
 
 
@@ -98,10 +121,12 @@ def reportRing(img):
     else:
         img_url = imagedownload_url_default
 
-    msg = {'timestamp': time.time(),
+    msg = {'id': str(uuid1()),
+           'timestamp': time.time(),
            'type': 'doorbell-ring',
            'origin': door_name,
            'picture_url': img_url}
+    print json.dumps(msg)
     rabbitmq_channel.basic_publish(exchange='chat', routing_key='', body=json.dumps(msg))
 
 
@@ -110,11 +135,12 @@ def start_thread():
     callback_thread = Thread(target=rabbitmq_callback_channel.start_consuming)
     callback_thread.start()
 
+
 def handle_image(frame):
     global reported, seen_persons, face_cascade, thread_running, force_send_picture
     try:
         grayscale = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    
+
         faces = face_cascade.detectMultiScale(
             grayscale,
             scaleFactor=1.1,
@@ -122,11 +148,11 @@ def handle_image(frame):
             minSize=(30, 30),
             flags=cv2.CASCADE_SCALE_IMAGE
         )
-    
-    #    for (x, y, w, h) in faces:
-    #        cv2.rectangle(frame, (x, y), (x + w, y + h), ((0, 255, 0) if reported else (0, 0, 255)), 2)
-    
-    
+
+        #    for (x, y, w, h) in faces:
+        #        cv2.rectangle(frame, (x, y), (x + w, y + h), ((0, 255, 0) if reported else (0, 0, 255)), 2)
+
+
         if force_send_picture:
             force_send_picture = False
             reportRing(frame)
@@ -150,7 +176,7 @@ def main():
     global face_cascade, thread_running, door_led_pwm, door_open_time
     thread_running = False
     start_thread()
-    
+
     door_led_pwm.start(0)
 
     vc = cv2.VideoCapture(0)
@@ -163,7 +189,7 @@ def main():
         if not ret:
             print "FATAL got no frame!"
             break
-        
+
         if not thread_running:
             print('Starting thread')
             thread_running = True
